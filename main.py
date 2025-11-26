@@ -1,16 +1,19 @@
+# main.py
+
 import asyncio
 import json
+import os
 import time
-from typing import List, Optional, Dict
+from typing import List, Optional, Dict, Set
 from dataclasses import dataclass, field
 import threading
 
-import websockets
 import requests
+import websockets
 
 from config import (
     TELEGRAM_TOKEN,
-    TELEGRAM_CHAT_ID,
+    TELEGRAM_ADMIN_ID,
     BINANCE_REST_URL,
     BINANCE_STREAM_URL,
     MAX_USDT_PAIRS,
@@ -21,43 +24,198 @@ from smc_logic import analyse_symbol
 from smc_scoring import score_smc_signal, tier_from_score, should_send_tier
 
 
-# ============ GLOBAL STATE ============
+SUBSCRIBERS_FILE = "subscribers.json"
+VIP_FILE = "vip_users.json"
+
+
+# ================== GLOBAL STATE ==================
 
 @dataclass
 class BotState:
-    scanning: bool = False          # False = mode siaga, True = scan & kirim sinyal
-    running: bool = True            # False = stop bot
-    last_update_id: Optional[int] = None  # untuk Telegram getUpdates offset
-    last_signal_time: Dict[str, float] = field(default_factory=dict)  # pair -> timestamp terakhir
+    scanning: bool = False
+    running: bool = True
+    last_update_id: Optional[int] = None
+
+    last_signal_time: Dict[str, float] = field(default_factory=dict)
+    min_tier: str = MIN_TIER_TO_SEND
+    cooldown_seconds: int = SIGNAL_COOLDOWN_SECONDS
+    debug: bool = False
+
+    subscribers: Set[int] = field(default_factory=set)
+
+    vip_users: Dict[int, float] = field(default_factory=dict)
+    daily_counts: Dict[int, int] = field(default_factory=dict)
+    daily_date: str = ""
+
 
 state = BotState()
 
 
-# ============ TELEGRAM ============
+# ================== UTIL & STORAGE ==================
 
-def send_telegram(text: str) -> None:
-    if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
-        print("Telegram token / chat_id belum di-set. Lewati pengiriman.")
+def is_admin(chat_id: int) -> bool:
+    return TELEGRAM_ADMIN_ID and str(chat_id) == str(TELEGRAM_ADMIN_ID)
+
+
+def load_subscribers() -> Set[int]:
+    if not os.path.exists(SUBSCRIBERS_FILE):
+        return set()
+    try:
+        with open(SUBSCRIBERS_FILE, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        return set(int(x) for x in data)
+    except Exception as e:
+        print("Gagal load subscribers:", e)
+        return set()
+
+
+def save_subscribers():
+    try:
+        with open(SUBSCRIBERS_FILE, "w", encoding="utf-8") as f:
+            json.dump(list(state.subscribers), f)
+    except Exception as e:
+        print("Gagal simpan subscribers:", e)
+
+
+def load_vip_users() -> Dict[int, float]:
+    if not os.path.exists(VIP_FILE):
+        return {}
+    try:
+        with open(VIP_FILE, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        return {int(k): float(v) for k, v in data.items()}
+    except Exception as e:
+        print("Gagal load VIP:", e)
+        return {}
+
+
+def save_vip_users():
+    try:
+        with open(VIP_FILE, "w", encoding="utf-8") as f:
+            json.dump({str(k): v for k, v in state.vip_users.items()}, f)
+    except Exception as e:
+        print("Gagal simpan VIP:", e)
+
+
+def is_vip(user_id: int) -> bool:
+    now = time.time()
+    if TELEGRAM_ADMIN_ID and str(user_id) == str(TELEGRAM_ADMIN_ID):
+        return True
+    exp = state.vip_users.get(user_id)
+    return bool(exp and exp > now)
+
+
+def cleanup_expired_vip():
+    now = time.time()
+    expired_ids = [uid for uid, exp in state.vip_users.items() if exp <= now]
+    if not expired_ids:
+        return
+    for uid in expired_ids:
+        del state.vip_users[uid]
+    save_vip_users()
+    print("VIP expired dihapus otomatis:", expired_ids)
+
+
+# ================== TELEGRAM ==================
+
+def send_telegram(text: str, chat_id: Optional[int] = None, reply_markup: dict | None = None) -> None:
+    if not TELEGRAM_TOKEN:
+        print("Telegram token belum di-set.")
         return
 
+    if chat_id is None:
+        if not TELEGRAM_ADMIN_ID:
+            print("Tidak ada TELEGRAM_ADMIN_ID.")
+            return
+        chat_id = int(TELEGRAM_ADMIN_ID)
+
     url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
+    data = {
+        "chat_id": chat_id,
+        "text": text,
+        "parse_mode": "Markdown",
+    }
+    if reply_markup is not None:
+        data["reply_markup"] = json.dumps(reply_markup)
+
     try:
-        r = requests.post(
-            url,
-            data={
-                "chat_id": TELEGRAM_CHAT_ID,
-                "text": text,
-                "parse_mode": "Markdown",
-            },
-            timeout=10,
-        )
+        r = requests.post(url, data=data, timeout=10)
         if not r.ok:
             print("Gagal kirim Telegram:", r.text)
     except Exception as e:
         print("Error kirim Telegram:", e)
 
 
-# ============ PAIRS ============
+def get_user_keyboard():
+    return {
+        "inline_keyboard": [
+            [
+                {"text": "🔔 Aktifkan Sinyal", "callback_data": "user_activate"},
+                {"text": "🔕 Nonaktifkan Sinyal", "callback_data": "user_deactivate"},
+            ],
+            [
+                {"text": "📊 Status Saya", "callback_data": "user_status"},
+                {"text": "⭐ Upgrade ke VIP", "callback_data": "user_upgrade"},
+            ],
+            [
+                {"text": "❓ Bantuan", "callback_data": "user_help"},
+            ],
+        ]
+    }
+
+
+def get_admin_keyboard():
+    return {
+        "inline_keyboard": [
+            [
+                {"text": "▶️ Mulai Scan", "callback_data": "admin_startscan"},
+                {"text": "⏸️ Pause Scan", "callback_data": "admin_pausescan"},
+            ],
+            [
+                {"text": "⚙️ Mode Tier", "callback_data": "admin_modetier"},
+                {"text": "⏲️ Cooldown", "callback_data": "admin_cooldown"},
+            ],
+            [
+                {"text": "📊 Status Bot", "callback_data": "admin_status"},
+                {"text": "🔄 Restart Bot", "callback_data": "admin_restart"},
+            ],
+            [
+                {"text": "⭐ VIP Control", "callback_data": "admin_vip"},
+                {"text": "❓ Help Admin", "callback_data": "admin_help"},
+            ],
+        ]
+    }
+
+
+def broadcast_signal(text: str):
+    """Kirim sinyal ke semua subscribers.
+    FREE: maksimal 2 sinyal per hari; VIP: unlimited."""
+    today = time.strftime("%Y-%m-%d")
+    if state.daily_date != today:
+        state.daily_date = today
+        state.daily_counts = {}
+        cleanup_expired_vip()
+        print("Reset daily_counts & cleanup VIP untuk hari baru:", today)
+
+    if not state.subscribers:
+        print("Belum ada subscriber. Kirim ke admin saja.")
+        send_telegram(text)
+        return
+
+    for cid in list(state.subscribers):
+        if is_vip(cid):
+            send_telegram(text, chat_id=cid)
+            continue
+
+        count = state.daily_counts.get(cid, 0)
+        if count >= 2:
+            continue
+
+        send_telegram(text, chat_id=cid)
+        state.daily_counts[cid] = count + 1
+
+
+# ================== BINANCE PAIRS ==================
 
 def get_usdt_pairs(max_pairs: int) -> List[str]:
     url = f"{BINANCE_REST_URL}/api/v3/exchangeInfo"
@@ -74,7 +232,7 @@ def get_usdt_pairs(max_pairs: int) -> List[str]:
     return symbols[:max_pairs]
 
 
-# ============ FORMAT PESAN ============
+# ================== SIGNAL MESSAGE ==================
 
 def build_signal_message(symbol: str, levels: dict, conditions: dict, score: int, tier: str) -> str:
     entry = levels["entry"]
@@ -83,98 +241,392 @@ def build_signal_message(symbol: str, levels: dict, conditions: dict, score: int
     tp2 = levels["tp2"]
     tp3 = levels["tp3"]
 
+    def yn(flag: bool) -> str:
+        return "✅" if flag else "❌"
+
+    bias_ok = conditions.get("bias_1h_not_bearish") or conditions.get("bias_1h_strong_bullish")
+    disc_ok = conditions.get("in_discount_50_62") or conditions.get("in_discount_62_79")
+    mb_or_bb = conditions.get("has_mitigation_block") or conditions.get("has_breaker_block")
+
     text = f"""
-🟦 SMC–ICT INTRADAY SIGNAL — {symbol}
+🟦 SMC–ICT INTRADAY SIGNAL — *{symbol}*
 
 SMC SCORE: *{score}/150* — Tier *{tier}*
 
-🎯 ENTRY TERBAIK
-→ `{entry:.4f}`
+💰 *Harga*
+• Entry : `{entry:.6f}`
+• SL    : `{sl:.6f}`
+• TP1   : `{tp1:.6f}`
+• TP2   : `{tp2:.6f}`
+• TP3   : `{tp3:.6f}`
 
-🛡 STOP LOSS
-→ `{sl:.4f}`
+📌 *Checklist SMC*
+• Bias 1H      : {yn(bias_ok)}
+• Struktur 15m : {yn(conditions.get("struct_15m_bullish"))}
+• Sweep        : {yn(conditions.get("has_big_sweep"))}
+• CHoCH        : {yn(conditions.get("has_choch_impulse"))}
+• Discount     : {yn(disc_ok)}
+• FVG          : {yn(conditions.get("has_fvg_fresh"))}
+• MB / Breaker : {yn(mb_or_bb)}
+• Liquidity    : {yn(conditions.get("liquidity_target_clear"))}
 
-💰 TAKE PROFIT
-→ TP1: `{tp1:.4f}`
-→ TP2: `{tp2:.4f}`
-→ TP3: `{tp3:.4f}`
-
-📌 MODE & ENTRY MODE
-- Bias 1H: {"strong bullish" if conditions.get("bias_1h_strong_bullish") else ("tidak bearish" if conditions.get("bias_1h_not_bearish") else "tidak mendukung")}
-- Struktur 15m: {"bullish / CHoCH naik" if conditions.get("struct_15m_bullish") else "tidak bullish"}
-- Trigger: {("Sweep + CHoCH + Discount" if (conditions.get("has_big_sweep") and conditions.get("has_choch_impulse") and (conditions.get("in_discount_50_62") or conditions.get("in_discount_62_79"))) else "Trigger belum lengkap")}
-
-📌 Confluence
-- FVG fresh: {conditions.get("has_fvg_fresh")}
-- Mitigation Block: {conditions.get("has_mitigation_block")}
-- Breaker Block: {conditions.get("has_breaker_block")}
-- Liquidity target: {conditions.get("liquidity_target_clear")}
-
-📌 Pump detector
-Anti fake pump & momentum filter aktif.
-
-📌 Catatan
-Akurasi lebih tinggi jika EMA/BB/RSI/Wick/Volume terlihat.
+📝 *Catatan*
+Free: maksimal 2 sinyal/hari. VIP: Unlimited sinyal.
 """
     return text
 
 
-# ============ TELEGRAM COMMAND HANDLER ============
+# ================== TELEGRAM COMMAND HANDLER ==================
 
-def handle_command(cmd: str, args: list):
+def handle_user_start(chat_id: int):
+    pkg = "VIP" if is_vip(chat_id) else "FREE"
+    limit = "Unlimited" if is_vip(chat_id) else "2 sinyal per hari"
+    active = "AKTIF" if chat_id in state.subscribers else "Tidak aktif"
+
+    send_telegram(
+        f"🟦 SMC INTRADAY SIGNAL BOT\n\n"
+        f"Status Kamu:\n"
+        f"• Paket : *{pkg}*\n"
+        f"• Limit : *{limit}*\n"
+        f"• Sinyal : *{active}*\n\n"
+        f"Gunakan tombol di bawah untuk mengatur sinyal.",
+        chat_id,
+        reply_markup=get_user_keyboard(),
+    )
+
+
+def handle_admin_start(chat_id: int):
+    send_telegram(
+        "👑 *SMC INTRADAY — ADMIN PANEL*\n\n"
+        "Bot siap. Gunakan menu di bawah untuk kontrol penuh.",
+        chat_id,
+        reply_markup=get_admin_keyboard(),
+    )
+
+
+def handle_command(cmd: str, args: list, chat_id: int):
     cmd = cmd.lower()
 
-    # /start → hanya pesan sambutan, tidak mengubah state
+    # /start
     if cmd == "/start":
-        send_telegram(
-            "SMC INTRADAY siap ✅\n\n"
-            "Ketik /startscan untuk *mulai scan & kirim sinyal*.\n"
-            "Ketik /help untuk melihat *daftar command*."
-        )
+        if is_admin(chat_id):
+            handle_admin_start(chat_id)
+        else:
+            handle_user_start(chat_id)
+        return
 
-    elif cmd == "/startscan":
+    # /help → diarahkan ke tombol help
+    if cmd == "/help":
+        if is_admin(chat_id):
+            send_telegram(
+                "📖 Bantuan admin tersedia di tombol *❓ Help Admin* pada panel.",
+                chat_id,
+                reply_markup=get_admin_keyboard(),
+            )
+        else:
+            send_telegram(
+                "📖 Bantuan user tersedia di tombol *❓ Bantuan* pada menu.",
+                chat_id,
+                reply_markup=get_user_keyboard(),
+            )
+        return
+
+    # ---------- USER COMMANDS ----------
+    if not is_admin(chat_id):
+        if cmd == "/activate":
+            if chat_id in state.subscribers:
+                send_telegram("ℹ️ Pencarian sinyal sudah *AKTIF*.", chat_id)
+            else:
+                state.subscribers.add(chat_id)
+                save_subscribers()
+                send_telegram("🔔 Pencarian sinyal *diaktifkan!*", chat_id)
+            return
+
+        if cmd == "/deactivate":
+            if chat_id in state.subscribers:
+                state.subscribers.remove(chat_id)
+                save_subscribers()
+                send_telegram("🔕 Pencarian sinyal *dinonaktifkan.*", chat_id)
+            else:
+                send_telegram("ℹ️ Pencarian sinyal sudah *tidak aktif*.", chat_id)
+            return
+
+        if cmd == "/mystatus":
+            now = time.time()
+            exp = state.vip_users.get(chat_id)
+            if exp and exp > now:
+                days_left = int((exp - now) / 86400)
+                pkg = f"VIP (sisa ~{days_left} hari)"
+                limit = "Unlimited"
+            else:
+                pkg = "FREE"
+                limit = "2 sinyal per hari"
+
+            active = "AKTIF ✅" if chat_id in state.subscribers else "TIDAK AKTIF ❌"
+            send_telegram(
+                "📊 *STATUS KAMU*\n\n"
+                f"Paket  : *{pkg}*\n"
+                f"Limit  : *{limit}*\n"
+                f"Sinyal : *{active}*\n"
+                f"User ID: `{chat_id}`",
+                chat_id,
+            )
+            return
+
+        # other user commands ignored
+        send_telegram("Perintah tidak dikenali. Gunakan tombol atau /start.", chat_id)
+        return
+
+    # ---------- ADMIN COMMANDS ----------
+    # Admin zona
+    if cmd == "/startscan":
         if state.scanning:
-            send_telegram("✅ Scan sudah *AKTIF*.")
+            send_telegram("ℹ️ Scan sudah *AKTIF*.", chat_id)
         else:
             state.scanning = True
-            send_telegram("▶ Scan *DIMULAI*.\nBot sekarang menganalisa market dan akan kirim sinyal.")
+            send_telegram("▶️ Scan market *dimulai*.", chat_id)
+        return
 
-    elif cmd == "/pausescan":
+    if cmd == "/pausescan":
         if not state.scanning:
-            send_telegram("⏸ Scan sudah *PAUSE* / belum dimulai.")
+            send_telegram("ℹ️ Scan sudah *PAUSE*.", chat_id)
         else:
             state.scanning = False
-            send_telegram("⏸ Scan *DIPAUSE*.\nBot standby, tidak menganalisa & tidak kirim sinyal.")
+            send_telegram("⏸️ Scan market *dijeda*.", chat_id)
+        return
 
-    elif cmd == "/status":
+    if cmd == "/status":
         send_telegram(
-            f"📊 STATUS BOT\n"
-            f"- Scanning: {'AKTIF' if state.scanning else 'STANDBY'}\n"
-            f"- Min Tier: {MIN_TIER_TO_SEND}\n"
-            f"- Max USDT pairs: {MAX_USDT_PAIRS}"
+            "📊 *STATUS BOT*\n\n"
+            f"Scan       : {'AKTIF' if state.scanning else 'STANDBY'}\n"
+            f"Min Tier   : {state.min_tier}\n"
+            f"Cooldown   : {state.cooldown_seconds} detik\n"
+            f"Subscribers: {len(state.subscribers)} user\n"
+            f"VIP Users  : {len(state.vip_users)} user\n",
+            chat_id,
         )
+        return
 
-    elif cmd == "/help":
+    if cmd == "/mode":
+        if not args:
+            send_telegram(
+                "Mode sekarang:\n"
+                f"- Min Tier: {state.min_tier}\n"
+                "Gunakan: /mode aplus | a | b",
+                chat_id,
+            )
+            return
+        mode = args[0].lower()
+        if mode == "aplus":
+            state.min_tier = "A+"
+        elif mode == "a":
+            state.min_tier = "A"
+        elif mode == "b":
+            state.min_tier = "B"
+        else:
+            send_telegram("Mode tidak dikenali. Gunakan: aplus | a | b", chat_id)
+            return
+        send_telegram(f"⚙️ Mode tier di-set ke: *{state.min_tier}*.", chat_id)
+        return
+
+    if cmd == "/cooldown":
+        if not args:
+            send_telegram(
+                f"Cooldown sekarang: {state.cooldown_seconds} detik.\n"
+                "Contoh: /cooldown 300  (5 menit)",
+                chat_id,
+            )
+            return
+        try:
+            cd = int(args[0])
+            if cd < 0:
+                raise ValueError
+            state.cooldown_seconds = cd
+            send_telegram(f"⏲️ Cooldown di-set ke {cd} detik.", chat_id)
+        except ValueError:
+            send_telegram("Format salah. Gunakan: /cooldown 300", chat_id)
+        return
+
+    if cmd == "/addvip":
+        if not args:
+            send_telegram("Gunakan: /addvip <user_id> [hari]", chat_id)
+            return
+        try:
+            target_id = int(args[0])
+            days = int(args[1]) if len(args) > 1 else 30
+        except ValueError:
+            send_telegram("Format salah. Contoh: /addvip 123456789 30", chat_id)
+            return
+        now = time.time()
+        new_exp = now + days * 86400
+        state.vip_users[target_id] = new_exp
+        save_vip_users()
+        send_telegram(f"⭐ VIP aktif untuk `{target_id}` selama {days} hari.", chat_id)
         send_telegram(
-            "📖 *Command List*\n\n"
-            "/startscan  - mulai scan & kirim sinyal\n"
-            "/pausescan  - hentikan scan (standby)\n"
-            "/status     - lihat status bot\n"
-            "/help       - bantuan\n"
-            "/stopbot    - hentikan bot (butuh run ulang di server)"
+            f"🎉 VIP kamu diaktifkan selama {days} hari.\n"
+            "Sinyal kamu sekarang *unlimited* per hari.",
+            target_id,
         )
+        return
 
-    elif cmd == "/stopbot":
+    if cmd == "/removevip":
+        if not args:
+            send_telegram("Gunakan: /removevip <user_id>", chat_id)
+            return
+        try:
+            target_id = int(args[0])
+        except ValueError:
+            send_telegram("Format salah. Contoh: /removevip 123456789", chat_id)
+            return
+        if target_id in state.vip_users:
+            del state.vip_users[target_id]
+            save_vip_users()
+            send_telegram(f"VIP user `{target_id}` dihapus.", chat_id)
+            send_telegram("VIP kamu telah dinonaktifkan. Kembali ke paket FREE.", target_id)
+        else:
+            send_telegram("User tersebut tidak terdaftar sebagai VIP.", chat_id)
+        return
+
+    if cmd == "/debug":
+        if not args:
+            send_telegram(f"Debug: {'ON' if state.debug else 'OFF'}", chat_id)
+            return
+        val = args[0].lower()
+        if val == "on":
+            state.debug = True
+            send_telegram("Debug *ON*.", chat_id)
+        elif val == "off":
+            state.debug = False
+            send_telegram("Debug *OFF*.", chat_id)
+        else:
+            send_telegram("Gunakan: /debug on | off", chat_id)
+        return
+
+    if cmd == "/stopbot":
         state.running = False
-        send_telegram("⛔ Bot akan berhenti. Jalankan lagi `python main.py` untuk start ulang.")
+        send_telegram("⛔ Bot akan berhenti. Jalankan ulang main.py untuk start lagi.", chat_id)
+        return
 
-    else:
-        send_telegram("Perintah tidak dikenali. Gunakan /help untuk daftar command.")
+    send_telegram("Perintah admin tidak dikenali.", chat_id)
 
+
+# ================== CALLBACK HANDLER ==================
+
+def handle_callback(data_cb: str, from_id: int, chat_id_cq: int):
+    # USER callbacks
+    if data_cb == "user_activate":
+        handle_command("/activate", [], chat_id_cq)
+        return
+    if data_cb == "user_deactivate":
+        handle_command("/deactivate", [], chat_id_cq)
+        return
+    if data_cb == "user_status":
+        handle_command("/mystatus", [], chat_id_cq)
+        return
+    if data_cb == "user_upgrade":
+        send_telegram(
+            "⭐ *UPGRADE KE VIP*\n\n"
+            "Paket VIP memberikan:\n"
+            "• Sinyal *unlimited* setiap hari\n"
+            "• Fokus pada Tier tinggi\n"
+            "• Masa aktif default 30 hari\n\n"
+            "Hubungi admin untuk upgrade:\n"
+            f"`{TELEGRAM_ADMIN_ID}` (Forward pesan /mystatus kamu).",
+            chat_id_cq,
+        )
+        return
+    if data_cb == "user_help":
+        send_telegram(
+            "📖 *BANTUAN PENGGUNA*\n\n"
+            "🔔 *Aktifkan Sinyal*\n"
+            "• Menghidupkan pencarian sinyal.\n"
+            "  FREE = 2 sinyal/hari, VIP = Unlimited.\n\n"
+            "🔕 *Nonaktifkan Sinyal*\n"
+            "• Mematikan pencarian sinyal. Tidak akan menerima sinyal.\n\n"
+            "📊 *Status Saya*\n"
+            "• Menampilkan status akun kamu (Free/VIP, limit harian, masa aktif).\n\n"
+            "⭐ *Upgrade ke VIP*\n"
+            "• Informasi paket VIP dan cara meningkatkan keanggotaan.\n\n"
+            "❓ *Bantuan*\n"
+            "• Menampilkan panduan penggunaan bot.",
+            chat_id_cq,
+        )
+        return
+
+    # ADMIN callbacks
+    if not is_admin(from_id):
+        send_telegram("Tombol ini hanya untuk admin.", chat_id_cq)
+        return
+
+    if data_cb == "admin_startscan":
+        handle_command("/startscan", [], chat_id_cq)
+        return
+    if data_cb == "admin_pausescan":
+        handle_command("/pausescan", [], chat_id_cq)
+        return
+    if data_cb == "admin_status":
+        handle_command("/status", [], chat_id_cq)
+        return
+    if data_cb == "admin_modetier":
+        send_telegram(
+            "⚙️ *Mode Tier*\n\n"
+            "Gunakan command:\n"
+            "`/mode aplus` — hanya Tier A+\n"
+            "`/mode a`     — Tier A & A+\n"
+            "`/mode b`     — Tier B, A, A+",
+            chat_id_cq,
+        )
+        return
+    if data_cb == "admin_cooldown":
+        send_telegram(
+            "⏲️ *Cooldown Sinyal*\n\n"
+            "Atur jarak minimal antar sinyal per pair.\n"
+            "Contoh:\n"
+            "`/cooldown 300`  (5 menit)\n"
+            "`/cooldown 900`  (15 menit)\n"
+            "`/cooldown 1800` (30 menit)",
+            chat_id_cq,
+        )
+        return
+    if data_cb == "admin_restart":
+        state.last_signal_time.clear()
+        send_telegram("🔄 Bot logic di-reset (last_signal_time dibersihkan).", chat_id_cq)
+        return
+    if data_cb == "admin_vip":
+        send_telegram(
+            "⭐ *VIP CONTROL*\n\n"
+            "Gunakan:\n"
+            "`/addvip <user_id> [hari]` — aktifkan VIP\n"
+            "`/removevip <user_id>` — hapus VIP user\n\n"
+            "User ID bisa dilihat dari perintah /mystatus user.",
+            chat_id_cq,
+        )
+        return
+    if data_cb == "admin_help":
+        send_telegram(
+            "📖 *BANTUAN ADMIN*\n\n"
+            "▶️ *Mulai Scan*\n"
+            "• Mengaktifkan pemindaian market.\n\n"
+            "⏸️ *Pause Scan*\n"
+            "• Menghentikan pemindaian sementara.\n\n"
+            "⚙️ *Mode Tier*\n"
+            "• Mengatur kualitas sinyal (A+, A, B).\n\n"
+            "⏲️ *Cooldown*\n"
+            "• Jarak minimal antar sinyal per pair.\n\n"
+            "📊 *Status Bot*\n"
+            "• Menampilkan status bot & statistik.\n\n"
+            "🔄 *Restart Bot*\n"
+            "• Me-reset logika bot (tanpa mematikan proses).\n\n"
+            "⭐ *VIP Control*\n"
+            "• Mengelola VIP user.\n\n"
+            "❓ *Help Admin*\n"
+            "• Menampilkan panduan admin ini.",
+            chat_id_cq,
+        )
+        return
 
 
 def telegram_command_loop():
-    """Loop polling Telegram getUpdates untuk membaca command admin."""
     if not TELEGRAM_TOKEN:
         print("Tidak ada TELEGRAM_TOKEN, command loop tidak dijalankan.")
         return
@@ -182,22 +634,18 @@ def telegram_command_loop():
     print("Telegram command loop start...")
     url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/getUpdates"
 
-    # ==== SYNC AWAL: ABAIKAN SEMUA PESAN LAMA ====
+    # sync awal: skip pesan lama
     try:
         r = requests.get(url, timeout=20)
         if r.ok:
             data = r.json()
             results = data.get("result", [])
             if results:
-                # set offset ke update_id terakhir, tapi TIDAK memproses isinya
                 state.last_update_id = results[-1]["update_id"]
-                print(f"Sync Telegram: skip {len(results)} pesan lama (last_update_id={state.last_update_id}).")
-        else:
-            print("Gagal sync awal Telegram:", r.text)
+                print(f"Sync Telegram: skip {len(results)} pesan lama.")
     except Exception as e:
         print("Error sync awal Telegram:", e)
 
-    # ==== LOOP UTAMA: HANYA PROSES PESAN BARU ====
     while state.running:
         try:
             params = {}
@@ -213,106 +661,134 @@ def telegram_command_loop():
             data = r.json()
             for upd in data.get("result", []):
                 state.last_update_id = upd["update_id"]
+
+                # pesan biasa
                 msg = upd.get("message")
-                if not msg:
+                if msg:
+                    chat = msg.get("chat", {})
+                    chat_id = chat.get("id")
+                    text = msg.get("text", "")
+
+                    if not text or not text.startswith("/"):
+                        continue
+
+                    parts = text.strip().split()
+                    cmd = parts[0]
+                    args = parts[1:]
+
+                    print(f"[TELEGRAM CMD] {chat_id} {cmd} {args}")
+                    handle_command(cmd, args, chat_id)
                     continue
 
-                chat_id = msg.get("chat", {}).get("id")
-                # Hanya izinkan command dari chat admin
-                if str(chat_id) != str(TELEGRAM_CHAT_ID):
-                    continue
+                # callback query
+                cq = upd.get("callback_query")
+                if cq:
+                    callback_id = cq.get("id")
+                    from_id = cq.get("from", {}).get("id")
+                    data_cb = cq.get("data")
+                    msg_cq = cq.get("message", {})
+                    chat_cq = msg_cq.get("chat", {})
+                    chat_id_cq = chat_cq.get("id")
 
-                text = msg.get("text", "")
-                if not text or not text.startswith("/"):
-                    continue
+                    print(f"[TELEGRAM CB] {from_id} {data_cb}")
 
-                parts = text.strip().split()
-                cmd = parts[0]
-                args = parts[1:]
+                    # jawab callback biar loading hilang
+                    try:
+                        answer_url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/answerCallbackQuery"
+                        requests.post(answer_url, data={"callback_query_id": callback_id}, timeout=10)
+                    except Exception as e:
+                        print("Error answerCallbackQuery:", e)
 
-                print(f"[TELEGRAM CMD] {cmd} {args}")
-                handle_command(cmd, args)
+                    if data_cb:
+                        handle_callback(data_cb, from_id, chat_id_cq)
 
         except Exception as e:
             print("Error di telegram_command_loop:", e)
             time.sleep(2)
 
 
-
-# ============ MAIN BOT LOOP (WEBSOCKET) ============
+# ================== MAIN SCAN LOOP (BINANCE WS) ==================
 
 async def run_bot():
+    state.subscribers = load_subscribers()
+    state.vip_users = load_vip_users()
+    state.daily_date = time.strftime("%Y-%m-%d")
+    cleanup_expired_vip()
+
+    print(f"Loaded {len(state.subscribers)} subscribers, {len(state.vip_users)} VIP users.")
+
     print("Mengambil list USDT pairs...")
     symbols = get_usdt_pairs(MAX_USDT_PAIRS)
     print(f"Scan {len(symbols)} pair:", ", ".join(s.upper() for s in symbols))
 
-    streams = "/".join([f"{s}@kline_1m" for s in symbols])
+    streams = "/".join([f"{s}@kline_5m" for s in symbols])
     ws_url = f"{BINANCE_STREAM_URL}?streams={streams}"
 
-    print("Menghubungkan ke WebSocket...")
-    async with websockets.connect(ws_url) as ws:
-        print("Bot dalam mode *SIAGA* (standby).")
-        print("Gunakan /startscan di Telegram untuk mulai scan.\n")
+    while state.running:
+        try:
+            print("Menghubungkan ke WebSocket...")
+            async with websockets.connect(ws_url) as ws:
+                print("WebSocket terhubung.")
+                print("Bot dalam mode STANDBY.")
+                print("Gunakan /startscan di Telegram untuk mulai scan.\n")
 
-        while state.running:
-            try:
-                msg = await ws.recv()
-                data = json.loads(msg)
+                while state.running:
+                    msg = await ws.recv()
+                    data = json.loads(msg)
 
-                kline = data.get("data", {}).get("k", {})
-                if not kline:
-                    continue
+                    kline = data.get("data", {}).get("k", {})
+                    if not kline:
+                        continue
 
-                is_closed = kline.get("x", False)
-                symbol = kline.get("s", "").upper()
+                    is_closed = kline.get("x", False)
+                    symbol = kline.get("s", "").upper()
 
-                if not is_closed or not symbol:
-                    continue
+                    if not is_closed or not symbol:
+                        continue
+                    if not state.scanning:
+                        continue
 
-                # Jika scanning = False → standby, tidak analisa apa-apa
-                if not state.scanning:
-                    # mode siaga, lewati analisa
-                    continue
+                    now = time.time()
+                    if state.cooldown_seconds > 0:
+                        last_ts = state.last_signal_time.get(symbol)
+                        if last_ts and now - last_ts < state.cooldown_seconds:
+                            if state.debug:
+                                print(f"[{symbol}] Skip cooldown ({int(now - last_ts)}s/{state.cooldown_seconds}s)")
+                            continue
 
-                # ==== CEK COOLDOWN PER PAIR ====
-                now = time.time()
-                if SIGNAL_COOLDOWN_SECONDS > 0:
-                    last_ts = state.last_signal_time.get(symbol)
-                if last_ts and now - last_ts < SIGNAL_COOLDOWN_SECONDS:
-                    # masih dalam cooldown → skip pair ini
-                    continue    
+                    if state.debug:
+                        print(f"[{time.strftime('%H:%M:%S')}] 5m close: {symbol}")
 
-                print(f"[{time.strftime('%H:%M:%S')}] 1m close: {symbol}")
+                    conditions, levels = analyse_symbol(symbol)
+                    if not conditions or not levels:
+                        continue
 
-                conditions, levels = analyse_symbol(symbol)
-                if not conditions or not levels:
-                    continue
+                    score = score_smc_signal(conditions)
+                    tier = tier_from_score(score)
 
-                score = score_smc_signal(conditions)
-                tier = tier_from_score(score)
+                    if not should_send_tier(tier, state.min_tier):
+                        if state.debug:
+                            print(f"[{symbol}] Tier {tier} < {state.min_tier}, skip.")
+                        continue
 
-                if not should_send_tier(tier, MIN_TIER_TO_SEND):
-                    continue
+                    text = build_signal_message(symbol, levels, conditions, score, tier)
+                    broadcast_signal(text)
 
-                text = build_signal_message(symbol, levels, conditions, score, tier)
-                send_telegram(text)
+                    state.last_signal_time[symbol] = now
+                    print(f"[{symbol}] Sinyal dikirim: Score {score}, Tier {tier}")
 
-                # simpan waktu sinyal terakhir untuk pair ini
-                state.last_signal_time[symbol] = now
+        except websockets.ConnectionClosed:
+            print("WebSocket terputus. Reconnect dalam 5 detik...")
+            await asyncio.sleep(5)
+        except Exception as e:
+            print("Error di run_bot (luar):", e)
+            print("Coba reconnect dalam 5 detik...")
+            await asyncio.sleep(5)
 
-                print(f"[{symbol}] Sinyal dikirim: Score {score}, Tier {tier}")
-
-            except websockets.ConnectionClosed:
-                print("WebSocket terputus. Reconnect dalam 5 detik...")
-                await asyncio.sleep(5)
-                return await run_bot()
-            except Exception as e:
-                print("Error di loop utama:", e)
-                await asyncio.sleep(1)
+    print("run_bot selesai karena state.running = False")
 
 
 if __name__ == "__main__":
-    # Mulai thread untuk command Telegram
     cmd_thread = threading.Thread(target=telegram_command_loop, daemon=True)
     cmd_thread.start()
 
@@ -320,4 +796,4 @@ if __name__ == "__main__":
         asyncio.run(run_bot())
     except KeyboardInterrupt:
         state.running = False
-        print("Bot dihentikan oleh user.")
+        print("Bot dihentikan oleh user (CTRL+C).")
