@@ -260,7 +260,7 @@ def broadcast_signal(text: str):
 def get_usdt_pairs(max_pairs: int) -> List[str]:
     """
     Ambil semua pair USDT yang statusnya TRADING,
-    lalu filter hanya yang 24h quote volume >= 5.000.000 USDT.
+    lalu filter hanya yang 24h quote volume >= 3.000.000 USDT.
     """
     # 1) Ambil info symbol (base/quote + status)
     info_url = f"{BINANCE_REST_URL}/api/v3/exchangeInfo"
@@ -291,7 +291,7 @@ def get_usdt_pairs(max_pairs: int) -> List[str]:
             vol_map[sym] = qv
 
     # 3) Filter volume >= 5 juta USDT
-    min_vol = 5_000_000.0
+    min_vol = 3_000_000.0
     filtered = [s for s in usdt_symbols if vol_map.get(s, 0.0) >= min_vol]
 
     # 4) Urutkan dari volume terbesar → terkecil, lalu batasi max_pairs
