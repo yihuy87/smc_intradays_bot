@@ -3,6 +3,7 @@
 import asyncio
 import json
 import os
+import sys
 import time
 import threading
 from typing import List, Optional, Dict, Set
@@ -23,8 +24,8 @@ from config import (
     SIGNAL_COOLDOWN_SECONDS,
     REFRESH_PAIR_INTERVAL_HOURS,
 )
+
 from smc_logic import analyse_symbol
-    # pastikan file smc_logic.py ada
 from smc_scoring import score_smc_signal, tier_from_score, should_send_tier
 
 # ===== FILE DATA PERSISTENT =====
@@ -37,8 +38,8 @@ STATE_FILE = "bot_state.json"
 
 @dataclass
 class BotState:
-    scanning: bool = False
-    running: bool = True
+    scanning: bool = False            # apakah scan market ON
+    running: bool = True              # kontrol main loop
     last_update_id: Optional[int] = None
 
     last_signal_time: Dict[str, float] = field(default_factory=dict)
@@ -51,6 +52,10 @@ class BotState:
     vip_users: Dict[int, float] = field(default_factory=dict)
     daily_counts: Dict[int, int] = field(default_factory=dict)
     daily_date: str = ""
+
+    # restart & pairs filter
+    request_soft_restart: bool = False
+    force_pairs_refresh: bool = False
 
 
 state = BotState()
@@ -155,6 +160,15 @@ def save_bot_state():
         print("Gagal simpan bot_state:", e)
 
 
+def hard_restart():
+    """Restart penuh proses Python (hard restart)."""
+    print("Hard restart dimulai...")
+    state.running = False
+    # flush stdout
+    sys.stdout.flush()
+    os.execl(sys.executable, sys.executable, *sys.argv)
+
+
 # ================== TELEGRAM ==================
 
 def send_telegram(
@@ -189,44 +203,51 @@ def send_telegram(
         print("Error kirim Telegram:", e)
 
 
-def get_user_keyboard() -> dict:
+# ========== REPLY KEYBOARD ==========
+
+def get_user_reply_keyboard() -> dict:
     return {
-        "inline_keyboard": [
+        "keyboard": [
             [
-                {"text": "🔔 Aktifkan Sinyal", "callback_data": "user_activate"},
-                {"text": "🔕 Nonaktifkan Sinyal", "callback_data": "user_deactivate"},
+                {"text": "🏠 Home"},
+                {"text": "🔔 Aktifkan Sinyal"},
+                {"text": "🔕 Nonaktifkan Sinyal"},
             ],
             [
-                {"text": "📊 Status Saya", "callback_data": "user_status"},
-                {"text": "⭐ Upgrade ke VIP", "callback_data": "user_upgrade"},
+                {"text": "📊 Status Saya"},
+                {"text": "⭐ Upgrade VIP"},
+                {"text": "❓ Bantuan"},
             ],
-            [
-                {"text": "❓ Bantuan", "callback_data": "user_help"},
-            ],
-        ]
+        ],
+        "resize_keyboard": True,
+        "one_time_keyboard": False,
     }
 
 
-def get_admin_keyboard() -> dict:
+def get_admin_reply_keyboard() -> dict:
     return {
-        "inline_keyboard": [
+        "keyboard": [
             [
-                {"text": "▶️ Mulai Scan", "callback_data": "admin_startscan"},
-                {"text": "⏸️ Pause Scan", "callback_data": "admin_pausescan"},
+                {"text": "🏠 Home"},
+                {"text": "▶️ Start Scan"},
+                {"text": "⏸️ Pause Scan"},
             ],
             [
-                {"text": "⚙️ Mode Tier", "callback_data": "admin_modetier"},
-                {"text": "⏲️ Cooldown", "callback_data": "admin_cooldown"},
+                {"text": "⛔ Stop Scan"},
+                {"text": "📊 Status Bot"},
+                {"text": "⚙️ Mode Tier"},
             ],
             [
-                {"text": "📊 Status Bot", "callback_data": "admin_status"},
-                {"text": "🔄 Restart Bot", "callback_data": "admin_restart"},
+                {"text": "⏲️ Cooldown"},
+                {"text": "⭐ VIP Control"},
+                {"text": "🔄 Restart Bot"},
             ],
             [
-                {"text": "⭐ VIP Control", "callback_data": "admin_vip"},
-                {"text": "❓ Help Admin", "callback_data": "admin_help"},
+                {"text": "❓ Help Admin"},
             ],
-        ]
+        ],
+        "resize_keyboard": True,
+        "one_time_keyboard": False,
     }
 
 
@@ -274,7 +295,6 @@ def broadcast_signal(text: str):
 
         send_telegram(text, chat_id=cid)
         state.daily_counts[cid] = count + 1
-
 
 
 # ================== BINANCE PAIRS ==================
@@ -327,7 +347,6 @@ def get_usdt_pairs(max_pairs: int) -> List[str]:
 
     print(f"Filter volume >= {min_vol:,.0f} USDT → {len(symbols_lower)} pair.")
     return symbols_lower
-
 
 
 # ================== SIGNAL MESSAGE ==================
@@ -387,9 +406,9 @@ def handle_user_start(chat_id: int):
         f"• Paket : *{pkg}*\n"
         f"• Limit : *{limit}*\n"
         f"• Sinyal : *{active}*\n\n"
-        f"Gunakan tombol di bawah untuk mengatur sinyal.",
+        f"Gunakan menu di bawah untuk mengatur sinyal.",
         chat_id,
-        reply_markup=get_user_keyboard(),
+        reply_markup=get_user_reply_keyboard(),
     )
 
 
@@ -398,7 +417,7 @@ def handle_admin_start(chat_id: int):
         "👑 *SMC INTRADAY — ADMIN PANEL*\n\n"
         "Bot siap. Gunakan menu di bawah untuk kontrol penuh.",
         chat_id,
-        reply_markup=get_admin_keyboard(),
+        reply_markup=get_admin_reply_keyboard(),
     )
 
 
@@ -417,15 +436,15 @@ def handle_command(cmd: str, args: list, chat_id: int):
     if cmd == "/help":
         if is_admin(chat_id):
             send_telegram(
-                "📖 Bantuan admin tersedia di tombol *❓ Help Admin* pada panel.",
+                "📖 Bantuan admin tersedia lewat tombol *❓ Help Admin* pada menu bawah.",
                 chat_id,
-                reply_markup=get_admin_keyboard(),
+                reply_markup=get_admin_reply_keyboard(),
             )
         else:
             send_telegram(
-                "📖 Bantuan user tersedia di tombol *❓ Bantuan* pada menu.",
+                "📖 Bantuan user tersedia lewat tombol *❓ Bantuan* pada menu bawah.",
                 chat_id,
-                reply_markup=get_user_keyboard(),
+                reply_markup=get_user_reply_keyboard(),
             )
         return
 
@@ -471,8 +490,7 @@ def handle_command(cmd: str, args: list, chat_id: int):
             )
             return
 
-        # other user commands
-        send_telegram("Perintah tidak dikenali. Gunakan tombol atau /start.", chat_id)
+        send_telegram("Perintah tidak dikenali. Gunakan menu bawah atau /start.", chat_id)
         return
 
     # ---------- ADMIN COMMANDS ----------
@@ -492,7 +510,17 @@ def handle_command(cmd: str, args: list, chat_id: int):
         else:
             state.scanning = False
             save_bot_state()
-            send_telegram("⏸️ Scan market *dijeda*.", chat_id)
+            send_telegram("⏸️ Scan market *dijeda* (sementara).", chat_id)
+        return
+
+    if cmd == "/stopscan":
+        if not state.scanning and not state.last_signal_time:
+            send_telegram("ℹ️ Scan sudah *NON-AKTIF* total.", chat_id)
+        else:
+            state.scanning = False
+            state.last_signal_time.clear()
+            save_bot_state()
+            send_telegram("⛔ Scan market *dihentikan total.*\nGunakan /startscan untuk mulai lagi dari awal.", chat_id)
         return
 
     if cmd == "/status":
@@ -604,6 +632,18 @@ def handle_command(cmd: str, args: list, chat_id: int):
             send_telegram("Gunakan: /debug on | off", chat_id)
         return
 
+    if cmd == "/softrestart":
+        state.request_soft_restart = True
+        state.force_pairs_refresh = True
+        state.last_signal_time.clear()
+        send_telegram("♻ Soft restart diminta. Bot akan refresh koneksi & engine.", chat_id)
+        return
+
+    if cmd == "/hardrestart":
+        send_telegram("🔄 Hard restart dimulai. Bot akan hidup kembali sebentar lagi...", chat_id)
+        hard_restart()
+        return  # tidak pernah sampai sini
+
     if cmd == "/stopbot":
         state.running = False
         send_telegram("⛔ Bot akan berhenti. Jalankan ulang main.py untuk start lagi.", chat_id)
@@ -615,118 +655,39 @@ def handle_command(cmd: str, args: list, chat_id: int):
 # ================== CALLBACK HANDLER ==================
 
 def handle_callback(data_cb: str, from_id: int, chat_id_cq: int):
-    # USER callbacks
-    if data_cb == "user_activate":
-        handle_command("/activate", [], chat_id_cq)
-        return
-    if data_cb == "user_deactivate":
-        handle_command("/deactivate", [], chat_id_cq)
-        return
-    if data_cb == "user_status":
-        handle_command("/mystatus", [], chat_id_cq)
-        return
-    if data_cb == "user_upgrade":
-        send_telegram(
-            "⭐ *UPGRADE KE VIP*\n\n"
-            "Paket VIP memberikan:\n"
-            "• Sinyal *unlimited* setiap hari\n"
-            "• Fokus pada Tier tinggi\n"
-            "• Masa aktif default 30 hari\n\n"
-            "Hubungi admin untuk upgrade:\n"
-            f"`{TELEGRAM_ADMIN_USERNAME}` (Forward pesan /mystatus kamu).",
-            chat_id_cq,
-        )
-        return
-    if data_cb == "user_help":
-        send_telegram(
-            "📖 *BANTUAN PENGGUNA*\n\n"
-            "🔔 *Aktifkan Sinyal*\n"
-            "• Menghidupkan pencarian sinyal.\n"
-            "  FREE = 2 sinyal/hari, VIP = Unlimited.\n\n"
-            "🔕 *Nonaktifkan Sinyal*\n"
-            "• Mematikan pencarian sinyal. Tidak akan menerima sinyal.\n\n"
-            "📊 *Status Saya*\n"
-            "• Menampilkan status akun kamu (Free/VIP, limit harian, masa aktif).\n\n"
-            "⭐ *Upgrade ke VIP*\n"
-            "• Informasi paket VIP dan cara meningkatkan keanggotaan.\n\n"
-            "❓ *Bantuan*\n"
-            "• Menampilkan panduan penggunaan bot.",
-            chat_id_cq,
-        )
+    # USER callbacks (kalau nanti mau pakai inline, sekarang fokus reply keyboard)
+    if data_cb == "user_soft_restart":  # tidak dipakai, placeholder
         return
 
     # ADMIN callbacks
+    if data_cb in ("admin_soft_restart", "admin_hard_restart", "admin_restart_cancel"):
+        if not is_admin(from_id):
+            send_telegram("Tombol ini hanya untuk admin.", chat_id_cq)
+            return
+
+        if data_cb == "admin_soft_restart":
+            state.request_soft_restart = True
+            state.force_pairs_refresh = True
+            state.last_signal_time.clear()
+            send_telegram("♻ Soft restart dimulai. Bot akan refresh koneksi & engine.", chat_id_cq)
+            return
+
+        if data_cb == "admin_hard_restart":
+            send_telegram("🔄 Hard restart dimulai. Bot akan hidup kembali sebentar lagi...", chat_id_cq)
+            hard_restart()
+            return  # tidak lanjut
+
+        if data_cb == "admin_restart_cancel":
+            send_telegram("❌ Restart dibatalkan.", chat_id_cq)
+            return
+
+    # callback lain (legacy), kalau ada
     if not is_admin(from_id):
         send_telegram("Tombol ini hanya untuk admin.", chat_id_cq)
         return
 
-    if data_cb == "admin_startscan":
-        handle_command("/startscan", [], chat_id_cq)
-        return
-    if data_cb == "admin_pausescan":
-        handle_command("/pausescan", [], chat_id_cq)
-        return
-    if data_cb == "admin_status":
-        handle_command("/status", [], chat_id_cq)
-        return
-    if data_cb == "admin_modetier":
-        send_telegram(
-            "⚙️ *Mode Tier*\n\n"
-            "Gunakan command:\n"
-            "`/mode aplus` — hanya Tier A+\n"
-            "`/mode a`     — Tier A & A+\n"
-            "`/mode b`     — Tier B, A, A+",
-            chat_id_cq,
-        )
-        return
-    if data_cb == "admin_cooldown":
-        send_telegram(
-            "⏲️ *Cooldown Sinyal*\n\n"
-            "Atur jarak minimal antar sinyal per pair.\n"
-            "Contoh:\n"
-            "`/cooldown 300`  (5 menit)\n"
-            "`/cooldown 900`  (15 menit)\n"
-            "`/cooldown 1800` (30 menit)",
-            chat_id_cq,
-        )
-        return
-    if data_cb == "admin_restart":
-        state.last_signal_time.clear()
-        send_telegram("🔄 Bot logic di-reset (last_signal_time dibersihkan).", chat_id_cq)
-        return
-    if data_cb == "admin_vip":
-        send_telegram(
-            "⭐ *VIP CONTROL*\n\n"
-            "Gunakan:\n"
-            "`/addvip <user_id> [hari]` — aktifkan VIP\n"
-            "`/removevip <user_id>` — hapus VIP user\n\n"
-            "User ID bisa dilihat dari perintah /mystatus user.",
-            chat_id_cq,
-        )
-        return
-    if data_cb == "admin_help":
-        send_telegram(
-            "📖 *BANTUAN ADMIN*\n\n"
-            "▶️ *Mulai Scan*\n"
-            "• Mengaktifkan pemindaian market.\n\n"
-            "⏸️ *Pause Scan*\n"
-            "• Menghentikan pemindaian sementara.\n\n"
-            "⚙️ *Mode Tier*\n"
-            "• Mengatur kualitas sinyal (A+, A, B).\n\n"
-            "⏲️ *Cooldown*\n"
-            "• Jarak minimal antar sinyal per pair.\n\n"
-            "📊 *Status Bot*\n"
-            "• Menampilkan status bot & statistik.\n\n"
-            "🔄 *Restart Bot*\n"
-            "• Me-reset logika bot (tanpa mematikan proses).\n\n"
-            "⭐ *VIP Control*\n"
-            "• Mengelola VIP user.\n\n"
-            "❓ *Help Admin*\n"
-            "• Menampilkan panduan admin ini.",
-            chat_id_cq,
-        )
-        return
 
+# ================== TELEGRAM POLLING LOOP ==================
 
 def telegram_command_loop():
     if not TELEGRAM_TOKEN:
@@ -771,9 +732,139 @@ def telegram_command_loop():
                     chat_id = chat.get("id")
                     text = msg.get("text", "")
 
-                    if not text or not text.startswith("/"):
+                    if not text:
                         continue
 
+                    # ---------- REPLY KEYBOARD HANDLER ----------
+
+                    # Tombol umum: Home
+                    if text == "🏠 Home":
+                        handle_command("/start", [], chat_id)
+                        continue
+
+                    # Tombol USER
+                    if text == "🔔 Aktifkan Sinyal":
+                        handle_command("/activate", [], chat_id)
+                        continue
+                    if text == "🔕 Nonaktifkan Sinyal":
+                        handle_command("/deactivate", [], chat_id)
+                        continue
+                    if text == "📊 Status Saya":
+                        handle_command("/mystatus", [], chat_id)
+                        continue
+                    if text == "⭐ Upgrade VIP":
+                        send_telegram(
+                            "⭐ *UPGRADE KE VIP*\n\n"
+                            "Paket VIP memberikan:\n"
+                            "• Sinyal *unlimited* setiap hari\n"
+                            "• Fokus pada Tier tinggi\n"
+                            "• Masa aktif default 30 hari\n\n"
+                            "Hubungi admin untuk upgrade:\n"
+                            f"`{TELEGRAM_ADMIN_USERNAME}` (Forward pesan /mystatus kamu).",
+                            chat_id,
+                        )
+                        continue
+                    if text == "❓ Bantuan" and not is_admin(chat_id):
+                        send_telegram(
+                            "📖 *BANTUAN PENGGUNA*\n\n"
+                            "🔔 Aktifkan Sinyal — hidupkan sinyal.\n"
+                            "🔕 Nonaktifkan Sinyal — matikan sinyal.\n"
+                            "📊 Status Saya — lihat paket & limit.\n"
+                            "⭐ Upgrade VIP — info upgrade.\n",
+                            chat_id,
+                        )
+                        continue
+
+                    # Tombol ADMIN
+                    if is_admin(chat_id):
+                        if text == "▶️ Start Scan":
+                            handle_command("/startscan", [], chat_id)
+                            continue
+                        if text == "⏸️ Pause Scan":
+                            handle_command("/pausescan", [], chat_id)
+                            continue
+                        if text == "⛔ Stop Scan":
+                            handle_command("/stopscan", [], chat_id)
+                            continue
+                        if text == "📊 Status Bot":
+                            handle_command("/status", [], chat_id)
+                            continue
+                        if text == "⚙️ Mode Tier":
+                            send_telegram(
+                                "⚙️ *Mode Tier*\n\n"
+                                "Gunakan command:\n"
+                                "`/mode aplus` — hanya Tier A+\n"
+                                "`/mode a`     — Tier A & A+\n"
+                                "`/mode b`     — Tier B, A, A+",
+                                chat_id,
+                            )
+                            continue
+                        if text == "⏲️ Cooldown":
+                            send_telegram(
+                                "⏲️ *Cooldown Sinyal*\n\n"
+                                "Atur jarak minimal antar sinyal per pair.\n"
+                                "Contoh:\n"
+                                "`/cooldown 300`  (5 menit)\n"
+                                "`/cooldown 900`  (15 menit)\n"
+                                "`/cooldown 1800` (30 menit)",
+                                chat_id,
+                            )
+                            continue
+                        if text == "⭐ VIP Control":
+                            send_telegram(
+                                "⭐ *VIP CONTROL*\n\n"
+                                "Gunakan:\n"
+                                "`/addvip <user_id> [hari]` — aktifkan VIP\n"
+                                "`/removevip <user_id>` — hapus VIP user\n\n"
+                                "User ID bisa dilihat dari perintah /mystatus user.",
+                                chat_id,
+                            )
+                            continue
+                        if text == "🔄 Restart Bot":
+                            # kirim pilihan soft/hard via inline keyboard
+                            send_telegram(
+                                "Pilih metode restart:",
+                                chat_id,
+                                reply_markup={
+                                    "inline_keyboard": [
+                                        [
+                                            {
+                                                "text": "♻ Soft Restart",
+                                                "callback_data": "admin_soft_restart",
+                                            },
+                                            {
+                                                "text": "🔄 Hard Restart",
+                                                "callback_data": "admin_hard_restart",
+                                            },
+                                        ],
+                                        [
+                                            {
+                                                "text": "❌ Batal",
+                                                "callback_data": "admin_restart_cancel",
+                                            }
+                                        ],
+                                    ]
+                                },
+                            )
+                            continue
+                        if text == "❓ Help Admin":
+                            send_telegram(
+                                "📖 *BANTUAN ADMIN*\n\n"
+                                "▶️ Start Scan / ⏸️ Pause Scan / ⛔ Stop Scan — kontrol scanning.\n"
+                                "📊 Status Bot — lihat status.\n"
+                                "⚙️ Mode Tier — atur kualitas sinyal.\n"
+                                "⏲️ Cooldown — atur jarak antar sinyal.\n"
+                                "⭐ VIP Control — kelola VIP.\n"
+                                "🔄 Restart Bot — Soft/Hard restart bot.\n",
+                                chat_id,
+                            )
+                            continue
+
+                    # Kalau bukan dari reply keyboard dan bukan command:
+                    if not text.startswith("/"):
+                        continue
+
+                    # ========== COMMAND BIASA (diawali /) ==========
                     parts = text.strip().split()
                     cmd = parts[0]
                     args = parts[1:]
@@ -825,7 +916,6 @@ async def run_bot():
 
     print(f"Loaded {len(state.subscribers)} subscribers, {len(state.vip_users)} VIP users.")
 
-    # ====== NEW: variabel untuk refresh pair ======
     symbols: List[str] = []
     last_pairs_refresh: float = 0.0
     refresh_interval = REFRESH_PAIR_INTERVAL_HOURS * 3600  # jumlah jam di kalikan 3600 detik
@@ -835,10 +925,15 @@ async def run_bot():
         try:
             # refresh daftar pair jika kosong atau sudah lewat jam interval
             now = time.time()
-            if not symbols or (now - last_pairs_refresh) > refresh_interval:
+            if (
+                not symbols
+                or (now - last_pairs_refresh) > refresh_interval
+                or state.force_pairs_refresh
+            ):
                 print("Refresh daftar pair USDT berdasarkan volume...")
                 symbols = get_usdt_pairs(MAX_USDT_PAIRS)
                 last_pairs_refresh = now
+                state.force_pairs_refresh = False
                 print(f"Scan {len(symbols)} pair:", ", ".join(s.upper() for s in symbols))
 
             streams = "/".join([f"{s}@kline_5m" for s in symbols])
@@ -853,7 +948,13 @@ async def run_bot():
                     print("Bot dalam mode STANDBY. Gunakan /startscan untuk mulai scan.\n")
 
                 while state.running:
-                    # Kalau sudah lewat jam interval sejak refresh pair → break, reconnect dengan list baru
+                    # cek soft restart
+                    if state.request_soft_restart:
+                        print("Soft restart diminta → memutus WS & refresh engine...")
+                        state.request_soft_restart = False
+                        break
+
+                    # cek perlu refresh pair karena 24 jam
                     if time.time() - last_pairs_refresh > refresh_interval:
                         print("24 jam berlalu → refresh daftar pair & reconnect WebSocket...")
                         break
@@ -880,7 +981,10 @@ async def run_bot():
                         last_ts = state.last_signal_time.get(symbol)
                         if last_ts and now - last_ts < state.cooldown_seconds:
                             if state.debug:
-                                print(f"[{symbol}] Skip cooldown ({int(now - last_ts)}s/{state.cooldown_seconds}s)")
+                                print(
+                                    f"[{symbol}] Skip cooldown "
+                                    f"({int(now - last_ts)}s/{state.cooldown_seconds}s)"
+                                )
                             continue
 
                     if state.debug:
@@ -913,7 +1017,6 @@ async def run_bot():
             await asyncio.sleep(5)
 
     print("run_bot selesai karena state.running = False")
-
 
 
 if __name__ == "__main__":
