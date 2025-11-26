@@ -230,8 +230,11 @@ def get_admin_keyboard() -> dict:
 
 
 def broadcast_signal(text: str):
-    """Kirim sinyal ke semua subscribers.
-    FREE: maksimal 2 sinyal per hari; VIP: unlimited."""
+    """Kirim sinyal:
+    - SELALU ke admin (unlimited)
+    - Juga ke semua subscribers (FREE:max 2 sinyal per hari / VIP: unlimited)
+    """
+    # Reset harian & bersihkan VIP expired
     today = time.strftime("%Y-%m-%d")
     if state.daily_date != today:
         state.daily_date = today
@@ -239,22 +242,38 @@ def broadcast_signal(text: str):
         cleanup_expired_vip()
         print("Reset daily_counts & cleanup VIP untuk hari baru:", today)
 
+    # 1) Selalu kirim ke ADMIN (kalau ada)
+    if TELEGRAM_ADMIN_ID:
+        try:
+            send_telegram(text, chat_id=int(TELEGRAM_ADMIN_ID))
+        except Exception as e:
+            print("Gagal kirim ke admin:", e)
+    else:
+        print("⚠️ TELEGRAM_ADMIN_ID belum di-set. Admin tidak menerima sinyal.")
+
+    # 2) Kirim ke subscribers (user)
     if not state.subscribers:
-        print("Belum ada subscriber. Kirim ke admin saja.")
-        send_telegram(text)
+        print("Belum ada subscriber. Hanya admin yang menerima sinyal.")
         return
 
     for cid in list(state.subscribers):
+        # Jangan proses admin lagi di sini (admin sudah dapat unlimited di atas)
+        if TELEGRAM_ADMIN_ID and str(cid) == str(TELEGRAM_ADMIN_ID):
+            continue
+
+        # VIP → unlimited
         if is_vip(cid):
             send_telegram(text, chat_id=cid)
             continue
 
+        # FREE → max 2 sinyal per hari
         count = state.daily_counts.get(cid, 0)
         if count >= 2:
             continue
 
         send_telegram(text, chat_id=cid)
         state.daily_counts[cid] = count + 1
+
 
 
 # ================== BINANCE PAIRS ==================
