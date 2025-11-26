@@ -816,7 +816,7 @@ def telegram_command_loop():
                                 "Gunakan:\n"
                                 "`/addvip <user_id> [hari]` — aktifkan VIP\n"
                                 "`/removevip <user_id>` — hapus VIP user\n\n"
-                                "User ID bisa dilihat dari perintah /mystatus user.",
+                                "User ID bisa dilihat dari perintah 📊 Status User.",
                                 chat_id,
                             )
                             continue
