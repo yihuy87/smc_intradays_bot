@@ -1,4 +1,4 @@
-# SMC ICT Intradays Bot (Signal Only, Mode B)
+# SMC ICT Intraday Bot (Signal Only, Mode B)
 
 Bot ini:
 - Scan beberapa pair **USDT** (default 50) via Binance
@@ -28,4 +28,4 @@ Bot ini:
 
 ```bash
 git clone ...
-cd smc-intradays-bot
+cd smc-intraday-bot
