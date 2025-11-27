@@ -351,46 +351,74 @@ def get_usdt_pairs(max_pairs: int) -> List[str]:
 
 # ================== SIGNAL MESSAGE ==================
 
-def build_signal_message(symbol: str, levels: dict, conditions: dict, score: int, tier: str) -> str:
+def build_signal_message(
+    symbol: str,
+    levels: dict,
+    conditions: dict,
+    score: int,
+    tier: str,
+    side: str = "long"
+) -> str:
     entry = levels["entry"]
     sl = levels["sl"]
     tp1 = levels["tp1"]
     tp2 = levels["tp2"]
     tp3 = levels["tp3"]
 
-    def yn(flag: bool) -> str:
+    # Helper ✅ / ❌
+    def mark(flag: bool) -> str:
         return "✅" if flag else "❌"
 
-    bias_ok = conditions.get("bias_1h_not_bearish") or conditions.get("bias_1h_strong_bullish")
+    # Checklist item
+    bias_ok = conditions.get("bias_1h_strong_bullish") or conditions.get("bias_1h_not_bearish")
+    struct_ok = conditions.get("struct_15m_bullish")
+    sweep_ok = conditions.get("has_big_sweep")
+    choch_ok = conditions.get("has_choch_impulse")
     disc_ok = conditions.get("in_discount_50_62") or conditions.get("in_discount_62_79")
-    mb_or_bb = conditions.get("has_mitigation_block") or conditions.get("has_breaker_block")
+    fvg_ok = conditions.get("has_fvg_fresh")
+    mb_ok = conditions.get("has_mitigation_block")
+    brk_ok = conditions.get("has_breaker_block")
+    liq_ok = conditions.get("liquidity_target_clear")
 
-    text = f"""
-🟦 SMC–ICT INTRADAY SIGNAL — *{symbol}*
+    mb_brk_ok = mb_ok or brk_ok
 
-SMC SCORE: *{score}/150* — Tier *{tier}*
+    # Context kompresi 70%
+    if conditions.get("has_pre_pump_context"):
+        context_text = "Kompresi candle 70% — potensi impuls bullish."
+    else:
+        context_text = "Context normal (belum ada kompresi signifikan)."
 
-💰 *Harga*
-• Entry : `{entry:.6f}`
-• SL    : `{sl:.6f}`
-• TP1   : `{tp1:.6f}`
-• TP2   : `{tp2:.6f}`
-• TP3   : `{tp3:.6f}`
+    side_label = "LONG" if side == "long" else "SHORT"
 
-📌 *Checklist SMC*
-• Bias 1H      : {yn(bias_ok)}
-• Struktur 15m : {yn(conditions.get("struct_15m_bullish"))}
-• Sweep        : {yn(conditions.get("has_big_sweep"))}
-• CHoCH        : {yn(conditions.get("has_choch_impulse"))}
-• Discount     : {yn(disc_ok)}
-• FVG          : {yn(conditions.get("has_fvg_fresh"))}
-• MB / Breaker : {yn(mb_or_bb)}
-• Liquidity    : {yn(conditions.get("liquidity_target_clear"))}
+    text = f"""🟦 SMC–ICT INTRADAY SIGNAL — {symbol}
 
-📝 *Catatan*
+SMC SCORE: {score}/150 — Tier {tier} — {side_label}
+
+💰 Harga
+• Entry : {entry:.6f}
+• SL    : {sl:.6f}
+• TP1   : {tp1:.6f}
+• TP2   : {tp2:.6f}
+• TP3   : {tp3:.6f}
+
+📌 Checklist SMC
+• Bias 1H      : {mark(bias_ok)}
+• Struktur 15m : {mark(struct_ok)}
+• Sweep        : {mark(sweep_ok)}
+• CHoCH        : {mark(choch_ok)}
+• Discount     : {mark(disc_ok)}
+• FVG          : {mark(fvg_ok)}
+• MB / Breaker : {mark(mb_brk_ok)}
+• Liquidity    : {mark(liq_ok)}
+
+📌 Context
+• {context_text}
+
+📝 Catatan
 Free: maksimal 2 sinyal/hari. VIP: Unlimited sinyal.
 """
     return text
+
 
 
 # ================== TELEGRAM COMMAND HANDLER ==================

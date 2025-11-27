@@ -9,6 +9,7 @@ Fokus:
 - Displacement / CHoCH yang benar-benar impuls
 - Entry di area discount + FVG/MB/Breaker
 - Ada tujuan liquidity di atas (target wajar)
+- Bonus: konteks kompresi (potensi impuls bullish)
 """
 
 def score_smc_signal(c: dict) -> int:
@@ -71,7 +72,14 @@ def score_smc_signal(c: dict) -> int:
         score += 10
 
     # ============================================================
-    # 7. SYNERGY BONUS: core SMC chain
+    # 7. PRE-PUMP CONTEXT (KOMPRESI 70%)
+    # ============================================================
+    if c.get("has_pre_pump_context"):
+        # bonus kecil, hanya konteks pendukung
+        score += 8
+
+    # ============================================================
+    # 8. SYNERGY BONUS: core SMC chain
     # ============================================================
     sweep = c.get("has_big_sweep")
     choch = c.get("has_choch_impulse")
